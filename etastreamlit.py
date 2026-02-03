@@ -8,7 +8,7 @@ st.set_page_config(page_title="FedEx Shipment ID Matcher", layout="wide")
 
 st.title("FedEx ETA ↔ Raw Data Matcher")
 st.write(
-    "Upload your **FedEx new raw data (CSV)** and the **ETA test file (Excel)**. "
+    "Upload your **FedEx raw data (CSV)** and the **ETA test file (Excel)**. "
     "The app matches Movement.ID to the first 8 characters of Order number, compares scheduled/actual arrival "
     "dates, and returns the matching Shipment ID."
 )
@@ -62,13 +62,30 @@ def make_time_key(dt: pd.Series, mode: str) -> pd.Series:
         return dt.dt.normalize()
     return dt.dt.floor("min")
 
+def excel_engine_from_filename(filename: str) -> str:
+    """
+    Pandas engine choice:
+      - .xls  -> xlrd
+      - .xlsx -> openpyxl
+    """
+    fn = (filename or "").lower()
+    if fn.endswith(".xls") and not fn.endswith(".xlsx"):
+        return "xlrd"
+    return "openpyxl"
+
 @st.cache_data(show_spinner=False)
 def load_raw_csv(file_bytes: bytes) -> pd.DataFrame:
+    # raw is big; keep dtype=str so IDs don't get mangled
     return pd.read_csv(io.BytesIO(file_bytes), dtype=str, low_memory=False)
 
 @st.cache_data(show_spinner=False)
-def load_eta_excel(file_bytes: bytes, sheet_name: str) -> pd.DataFrame:
-    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, dtype=str)
+def list_excel_sheets(file_bytes: bytes, engine: str) -> list[str]:
+    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
+    return xls.sheet_names
+
+@st.cache_data(show_spinner=False)
+def load_eta_excel(file_bytes: bytes, sheet_name: str, engine: str) -> pd.DataFrame:
+    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, engine=engine)
 
 def run_matching(
     raw: pd.DataFrame,
@@ -111,19 +128,11 @@ def run_matching(
     # Prepare raw key tables (dedupe to avoid exploding matches)
     raw_strict = raw[["_order_prefix", "_planned_key", "_actual_key", raw_ship_col]].dropna(
         subset=["_order_prefix", "_planned_key", "_actual_key"]
-    )
-    raw_strict = raw_strict.drop_duplicates(
-        subset=["_order_prefix", "_planned_key", "_actual_key"],
-        keep="first",
-    )
+    ).drop_duplicates(subset=["_order_prefix", "_planned_key", "_actual_key"], keep="first")
 
     raw_planned = raw[["_order_prefix", "_planned_key", raw_ship_col]].dropna(
         subset=["_order_prefix", "_planned_key"]
-    )
-    raw_planned = raw_planned.drop_duplicates(
-        subset=["_order_prefix", "_planned_key"],
-        keep="first",
-    )
+    ).drop_duplicates(subset=["_order_prefix", "_planned_key"], keep="first")
 
     # Strict match: prefix + scheduled + actual
     strict_merged = eta.merge(
@@ -133,13 +142,12 @@ def run_matching(
         how="left",
     )
 
-    # Planned-only match: prefix + scheduled only (useful when raw actual is blank)
+    # Planned-only match: prefix + scheduled only
     planned_merged = eta.merge(
         raw_planned,
         left_on=["_move_prefix", "_sched_key"],
         right_on=["_order_prefix", "_planned_key"],
         how="left",
-        suffixes=("", "_planned"),
     )
 
     eta_out = eta.copy()
@@ -177,18 +185,21 @@ def run_matching(
 col1, col2 = st.columns(2)
 
 with col1:
-    raw_file = st.file_uploader("Upload **FedEx new raw data** (CSV)", type=["csv"])
+    raw_file = st.file_uploader("Upload **FedEx raw data** (CSV)", type=["csv"])
 with col2:
-    eta_file = st.file_uploader("Upload **ETA test file** (Excel)", type=["xlsx", "xls"])
+    eta_file = st.file_uploader("Upload **ETA test file** (Excel: .xls or .xlsx)", type=["xls", "xlsx"])
 
-prefix_len = st.number_input("Prefix length to compare (Movement.ID vs Order number prefix)", min_value=1, max_value=50, value=8)
+prefix_len = st.number_input(
+    "Prefix length to compare (Movement.ID vs Order number prefix)",
+    min_value=1, max_value=50, value=8
+)
 
 match_mode = st.radio(
     "Match scheduled/actual arrival by:",
     options=["Date only", "Date & time (minute)"],
     index=0,
-    help="Your requirement said 'if the date matches' → Date only is the default. "
-         "If your files have reliable timestamps, you can switch to minute-level matching.",
+    help="Default is Date only because requirement said 'if the date matches'. "
+         "Use minute-level if timestamps are consistent.",
 )
 
 if not raw_file or not eta_file:
@@ -198,14 +209,26 @@ if not raw_file or not eta_file:
 raw_bytes = raw_file.getvalue()
 eta_bytes = eta_file.getvalue()
 
-# Let user pick sheet
-xls = pd.ExcelFile(io.BytesIO(eta_bytes))
-sheet_name = st.selectbox("Select sheet from ETA Excel", options=xls.sheet_names)
+# Detect correct Excel engine from filename
+eta_engine = excel_engine_from_filename(eta_file.name)
+
+# List sheets safely (works for both xls and xlsx)
+with st.spinner("Reading ETA workbook..."):
+    try:
+        sheet_names = list_excel_sheets(eta_bytes, engine=eta_engine)
+    except Exception as e:
+        st.error(
+            f"Failed to read Excel file. Detected engine: {eta_engine}. "
+            f"Error: {e}"
+        )
+        st.stop()
+
+sheet_name = st.selectbox("Select sheet from ETA Excel", options=sheet_names)
 
 # Load data
 with st.spinner("Loading files..."):
     df_raw = load_raw_csv(raw_bytes)
-    df_eta = load_eta_excel(eta_bytes, sheet_name=sheet_name)
+    df_eta = load_eta_excel(eta_bytes, sheet_name=sheet_name, engine=eta_engine)
 
 st.subheader("Preview")
 p1, p2 = st.columns(2)
@@ -234,17 +257,45 @@ with st.expander("Show / edit column mapping", expanded=True):
     c1, c2 = st.columns(2)
 
     with c1:
-        st.markdown("**FedEx new raw data (CSV)**")
-        raw_order_col = st.selectbox("Order number column", df_raw.columns, index=df_raw.columns.get_loc(raw_order_guess) if raw_order_guess in df_raw.columns else 0)
-        raw_planned_col = st.selectbox("Destination initial planned arrival time column", df_raw.columns, index=df_raw.columns.get_loc(raw_planned_guess) if raw_planned_guess in df_raw.columns else 0)
-        raw_actual_col = st.selectbox("Destination actual arrival time column", df_raw.columns, index=df_raw.columns.get_loc(raw_actual_guess) if raw_actual_guess in df_raw.columns else 0)
-        raw_ship_col = st.selectbox("Shipment ID column", df_raw.columns, index=df_raw.columns.get_loc(raw_ship_guess) if raw_ship_guess in df_raw.columns else 0)
+        st.markdown("**FedEx raw data (CSV)**")
+        raw_order_col = st.selectbox(
+            "Order number column",
+            df_raw.columns,
+            index=df_raw.columns.get_loc(raw_order_guess) if raw_order_guess in df_raw.columns else 0
+        )
+        raw_planned_col = st.selectbox(
+            "Destination initial planned arrival time column",
+            df_raw.columns,
+            index=df_raw.columns.get_loc(raw_planned_guess) if raw_planned_guess in df_raw.columns else 0
+        )
+        raw_actual_col = st.selectbox(
+            "Destination actual arrival time column",
+            df_raw.columns,
+            index=df_raw.columns.get_loc(raw_actual_guess) if raw_actual_guess in df_raw.columns else 0
+        )
+        raw_ship_col = st.selectbox(
+            "Shipment ID column",
+            df_raw.columns,
+            index=df_raw.columns.get_loc(raw_ship_guess) if raw_ship_guess in df_raw.columns else 0
+        )
 
     with c2:
         st.markdown("**ETA test file (Excel)**")
-        eta_move_col = st.selectbox("Movement.ID column", df_eta.columns, index=df_eta.columns.get_loc(eta_move_guess) if eta_move_guess in df_eta.columns else 0)
-        eta_sched_col = st.selectbox("Scheduled Arrival Date/Time column", df_eta.columns, index=df_eta.columns.get_loc(eta_sched_guess) if eta_sched_guess in df_eta.columns else 0)
-        eta_act_col = st.selectbox("Actual Arrival Date/Time column", df_eta.columns, index=df_eta.columns.get_loc(eta_act_guess) if eta_act_guess in df_eta.columns else 0)
+        eta_move_col = st.selectbox(
+            "Movement.ID column",
+            df_eta.columns,
+            index=df_eta.columns.get_loc(eta_move_guess) if eta_move_guess in df_eta.columns else 0
+        )
+        eta_sched_col = st.selectbox(
+            "Scheduled Arrival Date/Time column",
+            df_eta.columns,
+            index=df_eta.columns.get_loc(eta_sched_guess) if eta_sched_guess in df_eta.columns else 0
+        )
+        eta_act_col = st.selectbox(
+            "Actual Arrival Date/Time column",
+            df_eta.columns,
+            index=df_eta.columns.get_loc(eta_act_guess) if eta_act_guess in df_eta.columns else 0
+        )
 
 # ----------------------------
 # Run
@@ -297,6 +348,5 @@ if run:
         file_name="movement_to_shipment_id.csv",
         mime="text/csv",
     )
-
 else:
     st.info("Click **Run matching** to generate the output CSVs.")
