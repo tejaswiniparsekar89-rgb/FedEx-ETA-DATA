@@ -6,9 +6,9 @@ import streamlit as st
 
 st.set_page_config(page_title="FedEx Shipment ID Matcher", layout="wide")
 
-st.title("FedEx ETA ↔ Raw Data Matcher")
+st.title("FedEx ETA ↔ Raw Data Matcher (CSV only)")
 st.write(
-    "Upload your **FedEx raw data (CSV)** and the **ETA test file (Excel)**. "
+    "Upload your **FedEx raw data (CSV)** and the **ETA test file (CSV)**. "
     "The app matches Movement.ID to the first 8 characters of Order number, compares scheduled/actual arrival "
     "dates, and returns the matching Shipment ID."
 )
@@ -17,75 +17,43 @@ st.write(
 # Helpers
 # ----------------------------
 def canon(x: str) -> str:
-    """Canonicalize column names for robust matching."""
     return re.sub(r"[^a-z0-9]+", "", str(x).lower()).strip()
 
 def guess_col(df: pd.DataFrame, candidates: list[str]) -> str | None:
-    """Try to find a column in df matching any candidate name (case/space/punct tolerant)."""
     if df is None or df.empty:
         return None
 
     col_map = {canon(c): c for c in df.columns}
 
-    # exact canonical match
     for cand in candidates:
         key = canon(cand)
         if key in col_map:
             return col_map[key]
 
-    # substring canonical match (fallback)
     for cand in candidates:
         key = canon(cand)
         for c in df.columns:
             if key and key in canon(c):
                 return c
-
     return None
 
 def clean_id_series(s: pd.Series) -> pd.Series:
-    """Convert IDs to strings, trim, and remove trailing .0 (Excel numeric artifacts)."""
     s = s.astype(str).str.strip()
-    s = s.str.replace(r"\.0$", "", regex=True)
+    s = s.str.replace(r"\.0$", "", regex=True)  # remove Excel-like numeric artifacts
     return s
 
 def parse_dt(s: pd.Series) -> pd.Series:
-    """Parse datetimes safely."""
     return pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
 
 def make_time_key(dt: pd.Series, mode: str) -> pd.Series:
-    """
-    mode:
-      - 'Date only' -> normalize to midnight (date comparison)
-      - 'Date & time (minute)' -> floor to minute
-    """
     if mode == "Date only":
         return dt.dt.normalize()
     return dt.dt.floor("min")
 
-def excel_engine_from_filename(filename: str) -> str:
-    """
-    Pandas engine choice:
-      - .xls  -> xlrd
-      - .xlsx -> openpyxl
-    """
-    fn = (filename or "").lower()
-    if fn.endswith(".xls") and not fn.endswith(".xlsx"):
-        return "xlrd"
-    return "openpyxl"
-
 @st.cache_data(show_spinner=False)
-def load_raw_csv(file_bytes: bytes) -> pd.DataFrame:
-    # raw is big; keep dtype=str so IDs don't get mangled
+def load_csv(file_bytes: bytes) -> pd.DataFrame:
+    # dtype=str so IDs don't get mangled, low_memory=False for big CSV stability
     return pd.read_csv(io.BytesIO(file_bytes), dtype=str, low_memory=False)
-
-@st.cache_data(show_spinner=False)
-def list_excel_sheets(file_bytes: bytes, engine: str) -> list[str]:
-    xls = pd.ExcelFile(io.BytesIO(file_bytes), engine=engine)
-    return xls.sheet_names
-
-@st.cache_data(show_spinner=False)
-def load_eta_excel(file_bytes: bytes, sheet_name: str, engine: str) -> pd.DataFrame:
-    return pd.read_excel(io.BytesIO(file_bytes), sheet_name=sheet_name, dtype=str, engine=engine)
 
 def run_matching(
     raw: pd.DataFrame,
@@ -100,32 +68,31 @@ def run_matching(
     eta_sched_col: str,
     eta_act_col: str,
 ) -> tuple[pd.DataFrame, pd.DataFrame, dict]:
-    # Work on copies
+
     raw = raw.copy()
     eta = eta.copy()
 
-    # Clean IDs
+    # IDs
     raw[raw_order_col] = clean_id_series(raw[raw_order_col])
     eta[eta_move_col] = clean_id_series(eta[eta_move_col])
 
     raw["_order_prefix"] = raw[raw_order_col].str[:prefix_len]
     eta["_move_prefix"] = eta[eta_move_col].str[:prefix_len]
 
-    # Parse times
+    # Datetimes
     raw_planned_dt = parse_dt(raw[raw_planned_col])
     raw_actual_dt = parse_dt(raw[raw_actual_col])
 
     eta_sched_dt = parse_dt(eta[eta_sched_col])
     eta_act_dt = parse_dt(eta[eta_act_col])
 
-    # Create comparable keys (date-only or datetime-to-minute)
     raw["_planned_key"] = make_time_key(raw_planned_dt, match_mode)
     raw["_actual_key"] = make_time_key(raw_actual_dt, match_mode)
 
     eta["_sched_key"] = make_time_key(eta_sched_dt, match_mode)
     eta["_eta_actual_key"] = make_time_key(eta_act_dt, match_mode)
 
-    # Prepare raw key tables (dedupe to avoid exploding matches)
+    # Dedup raw keys to prevent exploding matches
     raw_strict = raw[["_order_prefix", "_planned_key", "_actual_key", raw_ship_col]].dropna(
         subset=["_order_prefix", "_planned_key", "_actual_key"]
     ).drop_duplicates(subset=["_order_prefix", "_planned_key", "_actual_key"], keep="first")
@@ -134,7 +101,7 @@ def run_matching(
         subset=["_order_prefix", "_planned_key"]
     ).drop_duplicates(subset=["_order_prefix", "_planned_key"], keep="first")
 
-    # Strict match: prefix + scheduled + actual
+    # Strict: prefix + scheduled + actual
     strict_merged = eta.merge(
         raw_strict,
         left_on=["_move_prefix", "_sched_key", "_eta_actual_key"],
@@ -142,7 +109,7 @@ def run_matching(
         how="left",
     )
 
-    # Planned-only match: prefix + scheduled only
+    # Planned-only: prefix + scheduled
     planned_merged = eta.merge(
         raw_planned,
         left_on=["_move_prefix", "_sched_key"],
@@ -179,6 +146,7 @@ def run_matching(
 
     return eta_out, mapping, metrics
 
+
 # ----------------------------
 # Upload UI
 # ----------------------------
@@ -187,7 +155,7 @@ col1, col2 = st.columns(2)
 with col1:
     raw_file = st.file_uploader("Upload **FedEx raw data** (CSV)", type=["csv"])
 with col2:
-    eta_file = st.file_uploader("Upload **ETA test file** (Excel: .xls or .xlsx)", type=["xls", "xlsx"])
+    eta_file = st.file_uploader("Upload **ETA test file** (CSV)", type=["csv"])
 
 prefix_len = st.number_input(
     "Prefix length to compare (Movement.ID vs Order number prefix)",
@@ -198,8 +166,7 @@ match_mode = st.radio(
     "Match scheduled/actual arrival by:",
     options=["Date only", "Date & time (minute)"],
     index=0,
-    help="Default is Date only because requirement said 'if the date matches'. "
-         "Use minute-level if timestamps are consistent.",
+    help="Default is Date only because requirement said 'if the date matches'."
 )
 
 if not raw_file or not eta_file:
@@ -209,26 +176,9 @@ if not raw_file or not eta_file:
 raw_bytes = raw_file.getvalue()
 eta_bytes = eta_file.getvalue()
 
-# Detect correct Excel engine from filename
-eta_engine = excel_engine_from_filename(eta_file.name)
-
-# List sheets safely (works for both xls and xlsx)
-with st.spinner("Reading ETA workbook..."):
-    try:
-        sheet_names = list_excel_sheets(eta_bytes, engine=eta_engine)
-    except Exception as e:
-        st.error(
-            f"Failed to read Excel file. Detected engine: {eta_engine}. "
-            f"Error: {e}"
-        )
-        st.stop()
-
-sheet_name = st.selectbox("Select sheet from ETA Excel", options=sheet_names)
-
-# Load data
-with st.spinner("Loading files..."):
-    df_raw = load_raw_csv(raw_bytes)
-    df_eta = load_eta_excel(eta_bytes, sheet_name=sheet_name, engine=eta_engine)
+with st.spinner("Loading CSVs..."):
+    df_raw = load_csv(raw_bytes)
+    df_eta = load_csv(eta_bytes)
 
 st.subheader("Preview")
 p1, p2 = st.columns(2)
@@ -240,7 +190,7 @@ with p2:
     st.dataframe(df_eta.head(200), use_container_width=True)
 
 # ----------------------------
-# Column mapping (auto-detect + allow override)
+# Column mapping
 # ----------------------------
 st.subheader("Column mapping (auto-detected — you can override)")
 
@@ -280,7 +230,7 @@ with st.expander("Show / edit column mapping", expanded=True):
         )
 
     with c2:
-        st.markdown("**ETA test file (Excel)**")
+        st.markdown("**ETA test file (CSV)**")
         eta_move_col = st.selectbox(
             "Movement.ID column",
             df_eta.columns,
@@ -331,7 +281,6 @@ if run:
     st.subheader("Output preview")
     st.dataframe(eta_out.head(200), use_container_width=True)
 
-    # Downloads
     full_csv = eta_out.to_csv(index=False).encode("utf-8")
     map_csv = mapping_out.to_csv(index=False).encode("utf-8")
 
