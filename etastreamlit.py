@@ -43,7 +43,7 @@ def clean_id_series(s: pd.Series) -> pd.Series:
     return s
 
 def parse_dt(s: pd.Series) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", infer_datetime_format=True)
+    return pd.to_datetime(s, errors="coerce")
 
 def make_time_key(dt: pd.Series, mode: str) -> pd.Series:
     if mode == "Date only":
